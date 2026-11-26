@@ -110,9 +110,12 @@ agent experiment.**
 
 Current output (5 seeds / 3 seeds):
 
-    A. fat tails      kurtosis   = 9.78   PASS   (real BTC ~10)
-       vol clustering sq-ret ACF1= 0.109  PASS   (real ~0.27 — moderate, see caveat)
+    A. fat tails      kurtosis   = 12.96  PASS   (real BTC ~10.6)
+       vol clustering sq-ret ACF1= 0.338  PASS   (real ~0.275)
        price impact   slope      > 0      PASS
+       volume varies  coeff of var= 1.12  PASS   (real ~1.0)
+       volume ~ |ret| correlation = 0.48  PASS   (>0)
+       impact R^2     (info)      = 0.202         (real 0.36)
     B.  median lev  accts liq  liq steps  max/step   bad debt
                  2        0.0        0.0       0.0          0
                  3        0.7        0.7       0.3          0
@@ -141,12 +144,13 @@ Almost none of this came from deleted code. It came from putting trader capital 
 the same scale as the book ($1,000 × 50 instead of $5k–20k × 100).
 
 ### Known open issues — read before Phase 1
-- **Volatility clustering is moderate, not matched** (ACF ~0.09–0.12 vs real ~0.27).
-  It is deliberately *not* pushed to 0.27: with a single AR(1) multiplier, raising
-  it to 0.27 drags kurtosis to 14–22 (real ~10). A one-parameter vol process can't
-  hit both targets at once — matching both would need a richer (GARCH/regime) vol
-  model, which is more than a relative-comparison design needs. Present + plausible
-  is the right call here; chasing 0.27 would be re-introducing the fitting we cut.
+- **Volatility clustering and fat tails now come mostly from order flow, not from
+  the index process**, and both slightly overshoot: ACF1 0.338 against a real
+  0.275, kurtosis 13.0 against 10.6. That is a better place to be than the
+  earlier 0.109 / 9.8, where the clustering came from a hand-set AR(1) and the
+  flow contributed nothing. The earlier note here said a one-parameter vol
+  process could not hit clustering and kurtosis together — true, but it turned
+  out not to be the binding constraint; the flow was.
 - **The risk metric now responds across a usable range**, after the leverage fix
   below: distinct accounts liquidated goes 0 → 0.7 → 2 → 9 → 18 → 27 → 31 as
   median leverage goes 2× → 20×. It was 0 at everything below 15×.
@@ -165,14 +169,14 @@ the same scale as the book ($1,000 × 50 instead of $5k–20k × 100).
   guards it); the anchor is the remaining pin, and it is worth a sensitivity run
   before Phase 1.
 
-- **The flow's per-minute volume is constant by construction.** `flow.py` draws
-  heavy-tailed sizes and then renormalises them so the total equals
-  `bg_flow_btc_per_min`, so measured over 600 minutes the volume is 0.170 BTC/min
-  at *both* 2.2 and 80 orders/min. Three consequences: volatility excitement adds
-  no volume (just more, smaller orders); there is no volume–volatility
-  correlation; and at 80 orders/min about 73% of draws fall below lot size and are
-  silently dropped. Phase-0's price-impact R² of 0.04 (vs 0.36 real) is most
-  likely this. Fix: scale `bg_flow_size_median_btc` and delete the renormalisation.
+- **Quoted spread degrades when the flow is aggressive**, and this is the
+  once-per-minute LP replenishment limit becoming visible rather than a flow
+  problem. `spread_rel` is recorded at the end of a step, after a minute of
+  trading against a ladder that is only re-quoted at the START of the next step,
+  so it measures "the book after a minute with no replenishment". Real books
+  refill in milliseconds. Median spread is 1.2e-4 against a real 8.8e-7. The fix
+  is intra-step replenishment (re-quote every k orders, or k sub-steps per
+  minute), and it is the next thing I would do.
 
 - **Liquidation mechanics are simplified in a direction that inflates severity**:
   full-size market IOC at any price, with no bankruptcy-price cap, no partial
@@ -339,6 +343,75 @@ one-sided 0.0%, near depth 0.403, spread 1.01e-6, hourly vol 0.00273), and
 amplification improved, because holding traders no longer push the price down on
 their own: at 10× the dip is −2.99% with liquidations and −0.10% without, so
 −2.89 pp of it is now attributable to forced selling (it was −1.26 pp).
+
+### What the flow can and cannot reproduce
+
+The background flow used to draw heavy-tailed order sizes and then **renormalise
+them so each minute's total equalled `bg_flow_btc_per_min`**. That pinned volume
+at 0.170 BTC/min at *both* 2.2 and 80 orders/min, with three consequences: no
+volume dispersion and so no volume/volatility relationship; a
+volatility-excitement modulator that added no volume at all, only more and
+smaller orders; and, at 80 orders/min, ~73% of draws pushed below the lot size
+and silently dropped. Phase-0 validation measured a price-impact R² of 0.04
+against 0.36 in real data — regressing price change on an order flow whose total
+is constant by construction.
+
+Now the **distribution** is calibrated once and each minute's volume is whatever
+the draws give. Sizes keep their real shape (median 0.002 BTC = 2 lots; σ = 2.754
+= √(2 ln 44.4), the real mean/median ratio) and the arrival rate is *derived* so
+expected volume per minute hits the target.
+
+Two bugs surfaced while doing it. The excitement multiplier was never centred, so
+it inflated total volume instead of redistributing it across time: for a normal
+move E|z| = √(2/π) = 0.798, giving a mean multiplier of 1 + 2.0×0.798 = 2.60, and
+measured volume came out **2.57×** the target. It is now mean-preserving, the same
+way `index_price.py` already centres its AR(1) vol multiplier. And the derived
+rate lands near 7/min rather than the depth-scaled real count of 2.19/min — the
+gap is exactly the size tail the cap removes.
+
+### Three anchors that cannot all hold at once
+
+Worth stating plainly, because Phase 0 kept rediscovering it as a bug:
+
+* near depth 0.49 BTC/side (real 123 × the 0.004 scale),
+* volume 0.194 BTC/min (real 48.5 × 0.004),
+* the real trade-size *shape* (median 0.002 BTC, mean/median 44.4).
+
+`volume/depth` survives the scaling (real 48.5/123 = 0.394; sim 0.194/0.49 =
+0.396). `mean trade size / depth` does not: real is 0.0887/123 = 0.00072, and
+keeping real-scale sizes in a 0.49 BTC book gives 0.181 — **251× more impactful
+per order**. Preserving it instead would need a mean trade of 0.00035 BTC, which
+is 0.35 lots: **below the exchange's own grid**. At a 0.004 scale the mini-market
+is finer than its 0.001 BTC lot size, and a 0.5 BTC order is already the whole
+near book. So the size tail cannot be as heavy as real, and the cap must do the
+truncating — it removes about 64% of the distribution's mean.
+
+### The cap is the dial, and here is what it buys
+
+Normal scenario, median 5×, 5 seeds, 600 steps:
+
+| cap | rate | BTC/min | vol CV | vol~\|r\| | impact R² | kurtosis | vol ACF1 | hourly vol | spread |
+|---|---|---|---|---|---|---|---|---|---|
+| 0.5 | 6.0 | 0.200 | 1.36 | 0.49 | 0.180 | 43.4 | 0.381 | 0.0083 | 1.0e-6 |
+| **0.3** | **7.4** | **0.202** | **1.12** | **0.48** | **0.202** | **13.0** | **0.338** | **0.0052** | **1.2e-4** |
+| 0.2 | 8.7 | 0.201 | 1.00 | 0.48 | 0.129 | 13.6 | 0.232 | 0.0042 | 2.0e-4 |
+| 0.1 | 12.0 | 0.196 | 0.85 | 0.46 | 0.098 | 9.8 | 0.162 | 0.0036 | 1.2e-4 |
+| 0.05 | 17.0 | 0.197 | 0.75 | 0.46 | 0.054 | 8.2 | 0.144 | 0.0032 | 4.1e-5 |
+| *real BTC* | *2.2* | *0.194* | *~1.0* | *>0* | *0.360* | *10.6* | *0.275* | *0.0026* | *8.8e-7* |
+| *old (renormalised)* | *80* | *0.163* | *0.26* | *0.08* | *0.006* | *9.8* | *0.109* | *0.0027* | *1.0e-6* |
+
+0.3 is the default: best impact R² of any setting, kurtosis 13.0 against 43.4 at
+the old cap, and the closest volatility clustering. **Be honest about the cost in
+the write-up:** against the old flow, hourly volatility goes from 1.05× real to
+2.0×, and median spread from 1.15× to 138×. The old spread and volatility
+matched *because the flow had no price effect at all* — a market whose order flow
+cannot move the price trivially inherits its volatility from the index. Those two
+numbers got worse because impact started existing.
+
+The liquidation response is unaffected by the cap (distinct accounts liquidated
+at 2×/5×/10×/20×: 0.0/2.7/18.0/31.3 at cap 0.5, 0.0/3.0/18.0/31.3 at cap 0.1),
+because liquidations are driven by the index path and the median mark rule, not
+by local flow noise. So this change does not move the headline risk metric.
 
 ### Reach sets the maximum representable cascade depth
 
