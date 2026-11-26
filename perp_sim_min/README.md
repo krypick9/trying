@@ -99,19 +99,29 @@ Two cheap, honest checks replace the calibration grid:
 (squared-return ACF1 > 0), positive price impact (buys push up).
 
 **B. Power check** (the important one): with scripted traders only, sweep leverage
-and confirm liquidations respond. *If the instrument can't register a known
+and confirm liquidations respond monotonically *and across a usable range*. It
+counts **distinct accounts liquidated**, not raw liquidation events — one trader
+that rebuilds and is liquidated again inflates the raw count without any extra
+risk having happened — and it requires at least 4 of 7 leverage levels to
+respond, because a metric that only fires at 20× cannot show an agent effect at a
+leverage anyone would run. *If the instrument can't register a known
 perturbation, it can't register an agent effect.* **Run this before any Phase-1
 agent experiment.**
 
 Current output (5 seeds / 3 seeds):
 
-    A. fat tails      kurtosis   = 8.83   PASS   (real BTC ~10)
-       vol clustering sq-ret ACF1= 0.076  PASS   (real ~0.27 — moderate, see caveat)
+    A. fat tails      kurtosis   = 9.78   PASS   (real BTC ~10)
+       vol clustering sq-ret ACF1= 0.109  PASS   (real ~0.27 — moderate, see caveat)
        price impact   slope      > 0      PASS
-    B. leverage  2x ->   0.0 liquidations
-       leverage  5x ->   0.0
-       leverage 10x ->   0.0
-       leverage 20x -> 731.7            monotone + detectable PASS
+    B.  median lev  accts liq  liq steps  max/step   bad debt
+                 2        0.0        0.0       0.0          0
+                 3        0.7        0.7       0.3          0
+                 5        2.0        1.0       2.0        115
+                 8        9.0        4.3       6.7        889
+                10       18.0        7.3      15.7       2252
+                15       27.0        9.3      24.7       7444
+                20       31.3       10.3      30.7      11752
+        monotone: True ; levels with liquidations: 6/7 -> PASS
 
 ### Where the market now sits vs real BTC
 
@@ -137,8 +147,9 @@ the same scale as the book ($1,000 × 50 instead of $5k–20k × 100).
   hit both targets at once — matching both would need a richer (GARCH/regime) vol
   model, which is more than a relative-comparison design needs. Present + plausible
   is the right call here; chasing 0.27 would be re-introducing the fitting we cut.
-- **The power check passes but as a cliff** (0 liquidations up to 10×, then ~730 at
-  20×). The instrument is insensitive to risk until extreme leverage.
+- **The risk metric now responds across a usable range**, after the leverage fix
+  below: distinct accounts liquidated goes 0 → 0.7 → 2 → 9 → 18 → 27 → 31 as
+  median leverage goes 2× → 20×. It was 0 at everything below 15×.
 
 - **The cascade amplifies, but only as deep as the book reaches.** Fixed in
   "the ladder, and why its shape is load-bearing" below. Forced selling now
@@ -146,13 +157,6 @@ the same scale as the book ($1,000 × 50 instead of $5k–20k × 100).
   dip saturates at about −3% because that is where the quoted ladder runs out.
   Cascades deeper than that are still not representable; widening the reach is a
   one-dial change with a documented trade-off (see the table below).
-
-- **The leverage cliff is unchanged and is now the main blocker.** The power
-  check still shows 0 liquidations at 2×, 5× and 10× and ~460 at 20×. The ladder
-  fix restored amplification *where liquidations already happen*; it did not make
-  liquidations happen at usable leverage. Until the risk metric responds across a
-  range, an agent effect has nothing to show up in. Candidates: raise the default
-  leverage band, deepen the stress path, or thin near depth.
 
 - **Funding is restored but still small**, because the premium it is computed from
   is near zero — the LP anchors the exchange price to the index at
@@ -212,7 +216,10 @@ control; nothing else about the market changes when you raise it.
    rather the scripted crowd provide liquidity, reinstate a maker archetype in
    `agents.py` and `population.py`.
 2. **One archetype = leveraged position-taker** with a `long_bias` knob. It's
-   symmetric at `long_bias=0.5`; raise it for crowded longs.
+   symmetric at `long_bias=0.5`; raise it for crowded longs. It **holds** its
+   position by default rather than re-targeting constant leverage — that choice
+   is what makes it liquidatable at all (see "Why the risk metric used to be
+   all-or-nothing").
 3. **Funding removed.** Re-add as a step in `exchange.step` if you decide perp
    funding matters for your risk metrics.
 
@@ -278,6 +285,60 @@ spread 1.0e-3 (~1000× real), local volatility 0.029 (~11× real). At 15 it is
 invisible in calm markets and still binds in a cascade; results are flat between
 15 and 40. `test_the_limit_must_exceed_what_ordinary_flow_pushes_onto_the_lp`
 guards this.
+
+### Why the risk metric used to be all-or-nothing
+
+Two causes, neither of them the leverage number itself.
+
+**Traders sold into their own losses.** `PositionTaker` re-targeted
+`leverage × equity / mark` on every act, so as equity fell it *reduced* its
+position to restore the target. That is a volatility-targeting strategy: it
+self-deleverages and is almost impossible to liquidate. The trace that showed it
+(stress, target 10×, seed 0):
+
+    step 301  price 94876  position 0.0940  equity 494.6  leverage 18.02
+    step 306  price 92266  position 0.0940  equity 352.6  leverage 24.88  <- worst
+    step 376  price 94964  position 0.0510  equity 484.8  leverage  9.99  <- sold
+
+It touched 24.88× and survived, then cut its position almost in half. Only at a
+20× target was the margin buffer (1/20 − 1% = 4%) thin enough that a fast move
+landed before the trader could rebalance. `rebalance="hold"` is now the default:
+size the position once from starting equity, then hold that many BTC, so
+leverage rises as equity falls. `rebalance="constant_leverage"` keeps the old
+behaviour, because *"do self-deleveraging traders cascade?"* is a real Phase-2
+question — it is just the wrong baseline.
+
+**Everyone had the same leverage, so everyone had the same liquidation price.**
+With maintenance margin at 1%, a held long needs roughly a (1/L − 1%) drop to
+breach: 48% at 2×, 19% at 5×, 9.1% at 10×, 4.0% at 20×. The stress path's index
+drawdown is ~8%, which sits *between* the 10× and 20× thresholds — so a uniform
+crowd gave nothing up to 10× and everything at 20×, with every breach landing in
+the same step (max liquidations per step equalled the number of distinct accounts
+liquidated). Leverage is now drawn per trader, lognormal around the median
+(`leverage_sigma=0.6`, clipped to 1–20×), which spreads the thresholds out.
+`leverage_sigma=0` reproduces a uniform crowd.
+
+Distinct accounts liquidated, stress, `long_bias=0.7`, 3 seeds, 600 steps:
+
+| median leverage | 2× | 3× | 5× | 8× | 10× | 15× | 20× | levels responding |
+|---|---|---|---|---|---|---|---|---|
+| constant leverage, uniform (old) | 0 | 0 | 0 | 0 | 0 | 20.0 | 35.0 | **2/7** |
+| hold, uniform | 0 | 0 | 0 | 0 | 0 | 35.0 | 35.0 | 2/7 |
+| **hold + dispersed (new)** | 0 | 0.7 | 2.0 | 9.0 | 18.0 | 27.0 | 31.3 | **6/7** |
+
+Hold mode alone does not help — it makes the cliff *more* severe when it fires
+(bad debt $6,544 at 15× against $34 before). Dispersion is what makes the
+response graded. Both together also spread the breaches over time: at 10×, 18
+accounts liquidate across 7.3 steps with at most 15.7 in any one step, instead of
+all of them at once.
+
+Bad debt responds smoothly too: $0, $0, $115, $889, $2,252, $7,444, $11,752.
+
+Calm-market microstructure is unchanged by this (normal, median 5×, 5 seeds:
+one-sided 0.0%, near depth 0.403, spread 1.01e-6, hourly vol 0.00273), and
+amplification improved, because holding traders no longer push the price down on
+their own: at 10× the dip is −2.99% with liquidations and −0.10% without, so
+−2.89 pp of it is now attributable to forced selling (it was −1.26 pp).
 
 ### Reach sets the maximum representable cascade depth
 
