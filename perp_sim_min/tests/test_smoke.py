@@ -1,5 +1,10 @@
-"""Compact tests for the minimal simulator: order book, accounts/margin,
-the liquidation cascade, and the replace-not-add fairness guarantee."""
+"""End-to-end smoke tests: the shortest path that proves the whole loop runs.
+
+Mechanism-level coverage lives in test_engine.py and the replace-not-add
+guarantee in test_population.py. The fairness test that used to live here built
+n_llm=0 twice, so it checked determinism rather than the invariant; the real
+version is test_population.SlotTests.test_slots_do_not_depend_on_how_many_llm_agents.
+"""
 
 import os
 import sys
@@ -50,18 +55,6 @@ def test_liquidations_can_be_disabled_as_control():
     ex, _ = run("stress", n_steps=300, seed=0, spec=spec,
                 cfg_overrides={"liquidations_enabled": False})
     assert summarize(ex)["liquidations"] == 0
-
-
-# ---- replace-not-add fairness ------------------------------------------
-def test_swap_order_is_seed_stable_and_capital_constant():
-    spec = PopulationSpec()
-    p0 = build_population(seed=7, spec=spec, n_llm=0)
-    # a scripted-only build is reproducible; slots don't depend on n_llm
-    slots_a = [(s.account_id, s.cash, s.direction, s.swap_rank) for s in p0.slots]
-    p1 = build_population(seed=7, spec=spec, n_llm=0)
-    slots_b = [(s.account_id, s.cash, s.direction, s.swap_rank) for s in p1.slots]
-    assert slots_a == slots_b
-    assert abs(sum(s.cash for s in p0.slots) - spec.m_traders * spec.collateral) < 1e-6
 
 
 def test_index_path_independent_of_traders():

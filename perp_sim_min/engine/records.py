@@ -10,8 +10,8 @@ detector relies on):
                     how many agents are buying). For research measures and
                     labelling, never as detector inputs.
 
-Funding and circuit-breaker columns from the Phase-0 record were removed with
-those features (see README).
+Circuit-breaker columns from the Phase-0 record were removed with that feature.
+Funding columns are back (funding was restored after review -- see README).
 """
 
 import csv
@@ -40,6 +40,9 @@ class StepRecord:
     order_flow_imbalance: float = 0.0  # signed_volume / volume
     n_trades: int = 0
     open_interest: float = 0.0
+    funding_rate_est: float = 0.0      # the rate that would be charged now, per hour
+    last_funding_rate: float = 0.0     # the rate actually charged at the last settlement
+    funding_settled: bool = False      # True on the steps where funding changed hands
     liq_count: int = 0
     liq_notional: float = 0.0
     liq_qty_long: float = 0.0          # longs force-closed (forced SELLING)
