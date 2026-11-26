@@ -7,14 +7,16 @@ One call to Exchange.step(actions) is one tick of the clock. In order:
   2. stale orders expire, and the background liquidity provider re-quotes
   3. traders' orders arrive (shuffled) and are matched, with background taker flow
   4. any account that has lost too much is force-closed  <- the liquidation engine
-  5. bad debt is swept and everything is written down (one StepRecord)
+  5. the premium is sampled, and funding is paid if an hour has passed
+  6. bad debt is swept and everything is written down (one StepRecord)
 
 Traders never touch the exchange's internals. They call view(account_id) to see
 what a real trader could see and hand back a list of actions.
 
-Trimmed from Phase-0 (see README "What was cut"): funding settlement, the circuit
-breaker, historical replay, and the LP "backstop" branch (there are no MakerBots
-to back up in the minimal version -- the LP is the only resting liquidity).
+Trimmed from Phase-0 (see README "What was cut"): the circuit breaker and the LP
+"backstop" branch (there are no MakerBots to back up here -- the LP is the only
+resting liquidity). Funding settlement and historical replay were restored after
+review; see README "Restored after review".
 """
 
 import math
@@ -26,7 +28,7 @@ from typing import Optional
 from .accounts import Account
 from .config import Scenario, SimConfig
 from .flow import FLOW_ID, BackgroundTakerFlow
-from .index_price import IndexPriceProcess
+from .index_price import IndexPriceProcess, ReplayIndexPrice
 from .orderbook import BUY, EPS, SELL, Order, OrderBook
 from .records import StepRecord
 
@@ -76,6 +78,9 @@ class MarketView:
     mid: Optional[float]
     depth_bid: float
     depth_ask: float
+    funding_rate_est: float
+    last_funding_rate: float
+    steps_to_funding: int
     open_interest: float
     liq_count_last_step: int
     liq_notional_last_step: float
@@ -112,8 +117,10 @@ class Exchange:
         self.cfg = cfg
         self.scenario = scenario
         # Separate random streams: the index path is identical for a given
-        # regime/seed regardless of how many traders there are.
-        self.index = IndexPriceProcess(cfg, scenario, random.Random(f"{cfg.seed}|index"))
+        # regime/seed regardless of how many traders there are. A replay
+        # scenario follows a stored real path instead of the synthetic process.
+        index_cls = ReplayIndexPrice if getattr(scenario, "use_replay", False) else IndexPriceProcess
+        self.index = index_cls(cfg, scenario, random.Random(f"{cfg.seed}|index"))
         self.rng_arrival = random.Random(f"{cfg.seed}|arrival")
         self.book = OrderBook(cfg.tick_size)
         self.accounts = {}
@@ -124,6 +131,8 @@ class Exchange:
         self.index_history = [cfg.initial_price]
         self.price_history = [cfg.initial_price]
         self.bad_debt = 0.0
+        self.premium_buffer = []
+        self.last_funding_rate = 0.0
         self.last_liq_count = 0
         self.last_liq_notional = 0.0
         self.records = []
@@ -166,6 +175,16 @@ class Exchange:
         mid = (bid + ask) / 2 if bid is not None and ask is not None else self.last_price
         return median([self.index_price, self.last_price, mid])
 
+    def _funding_rate_now(self) -> float:
+        """The hourly funding rate implied by how far the exchange price has sat
+        above or below the index since the last settlement, capped both ways."""
+        if not self.premium_buffer:
+            return self.last_funding_rate
+        mean_premium = sum(self.premium_buffer) / len(self.premium_buffer)
+        rate = mean_premium * self.cfg.funding_scale + self.cfg.funding_interest_per_hour
+        cap = self.cfg.funding_cap_per_hour
+        return max(-cap, min(cap, rate))
+
     # ---- what a trader sees -----------------------------------------------
     def view(self, account_id: str) -> MarketView:
         cfg, mm = self.cfg, self.cfg.maintenance_margin_rate
@@ -196,6 +215,9 @@ class Exchange:
             mid=self.book.mid(),
             depth_bid=depth_bid,
             depth_ask=depth_ask,
+            funding_rate_est=self._funding_rate_now(),
+            last_funding_rate=self.last_funding_rate,
+            steps_to_funding=cfg.funding_interval_steps - (self.step_count % cfg.funding_interval_steps),
             open_interest=self._open_interest(),
             liq_count_last_step=self.last_liq_count,
             liq_notional_last_step=self.last_liq_notional,
@@ -234,9 +256,14 @@ class Exchange:
         self.last_liq_notional = sum(e.notional for e in events)
 
         self.price_history.append(self.last_price)
+        self._sample_premium()
+        settled = False
+        if cfg.funding_enabled and t % cfg.funding_interval_steps == 0:
+            self._settle_funding()
+            settled = True
         self._sweep_bad_debt()
 
-        record = self._make_record(t, stats, events, prev_last, prev_index)
+        record = self._make_record(t, stats, events, settled, prev_last, prev_index)
         self.records.append(record)
         return record
 
@@ -373,6 +400,30 @@ class Exchange:
         self.liquidation_log.append(event)
         return event
 
+    # ---- funding ----------------------------------------------------------
+    def _sample_premium(self) -> None:
+        """Record how far the exchange price sits from the index this step."""
+        mid = self.book.mid()
+        price = mid if mid is not None else self.last_price
+        self.premium_buffer.append((price - self.index_price) / self.index_price)
+
+    def _settle_funding(self) -> None:
+        """Hourly cash transfer between longs and shorts. If the exchange price
+        has been above the index, longs pay shorts (and the reverse). Every
+        dollar one side pays, the other receives, so it is zero-sum across all
+        accounts. It matters here because it drains the crowded side's
+        collateral between liquidations."""
+        cfg = self.cfg
+        rate = self._funding_rate_now()
+        hours = cfg.funding_interval_steps * cfg.hours_per_step
+        mark = self.mark_price()
+        for a in self.accounts.values():
+            payment = a.position * mark * rate * hours
+            a.collateral -= payment
+            a.funding_paid += payment
+        self.last_funding_rate = rate
+        self.premium_buffer.clear()
+
     def _sweep_bad_debt(self) -> None:
         """If a closed account owes more than its cash, nobody can collect:
         record it as bad debt (auto-deleveraging is a Phase-2 intervention, not
@@ -383,7 +434,7 @@ class Exchange:
                 a.collateral = 0.0
 
     # ---- bookkeeping ------------------------------------------------------
-    def _make_record(self, t, stats, events, prev_last, prev_index) -> StepRecord:
+    def _make_record(self, t, stats, events, settled, prev_last, prev_index) -> StepRecord:
         cfg, mm = self.cfg, self.cfg.maintenance_margin_rate
         mark = self.mark_price()
         bid, ask = self.book.best_bid(), self.book.best_ask()
@@ -416,6 +467,9 @@ class Exchange:
             order_flow_imbalance=(stats.signed / stats.volume) if stats.volume else 0.0,
             n_trades=stats.n_trades,
             open_interest=self._open_interest(),
+            funding_rate_est=self._funding_rate_now(),
+            last_funding_rate=self.last_funding_rate,
+            funding_settled=settled,
             liq_count=len(events),
             liq_notional=sum(e.notional for e in events),
             liq_qty_long=sum(e.qty_filled for e in events if e.side_closed == "long"),

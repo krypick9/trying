@@ -8,11 +8,15 @@ match real Bybit/Binance numbers. That is why there is no calibration grid and
 no moment-matching: see README.md.
 
 Removed from the Phase-0 config on purpose (see README "What was cut"):
-  - funding rate (hourly, tiny, was an uncalibrated default)
   - circuit breaker (that is a Phase-2 intervention, not the baseline model)
-  - AR(1) volatility clustering (never reached the real value; one stylized fact)
-  - historical replay (kept the environment synthetic-only)
   - the market-scale calibration machinery and its many flow dials
+
+Restored after review (see README "Restored after review"):
+  - funding (a perpetual-futures risk channel; the Phase-0 cap was ~1/20 of the
+    real venue cap, which is why it looked negligible -- the cap, not the
+    mechanism, was the problem)
+  - AR(1) volatility clustering, as a hand-set vol multiplier (see Scenario)
+  - historical replay of a real BTC path, as a third scenario
 """
 
 from dataclasses import dataclass
@@ -39,6 +43,18 @@ class SimConfig:
     # ---- fees (plausible perp rates) -------------------------------------
     taker_fee: float = 0.00045
     maker_fee: float = 0.00015
+
+    # ---- funding (perpetual-futures cash transfer between longs and shorts) --
+    # Restored after review. Funding is what drains a crowded side's collateral
+    # between liquidations, so it belongs in a perp risk study. The Phase-0 cap
+    # (1.25e-5 per hour) was ~1/20 of a real venue's 0.75% per 8h, which made
+    # funding look irrelevant; the cap below is the real order of magnitude.
+    # Set funding_enabled=False for a no-funding counterfactual.
+    funding_enabled: bool = True
+    funding_interval_minutes: float = 60.0
+    funding_scale: float = 0.125                     # share of the average premium paid per hour
+    funding_interest_per_hour: float = 0.0000121425  # Hyperliquid-style interest component
+    funding_cap_per_hour: float = 0.0009375          # = 0.75% per 8h, the Binance/Bybit cap
 
     # ---- background liquidity provider (the resting book) ----------------
     # One liquidity source for the whole market (Phase-0 had three: this LP,
@@ -78,6 +94,10 @@ class SimConfig:
     def hours_per_step(self) -> float:
         return self.step_minutes / 60.0
 
+    @property
+    def funding_interval_steps(self) -> int:
+        return max(1, round(self.funding_interval_minutes / self.step_minutes))
+
 
 @dataclass(frozen=True)
 class Scenario:
@@ -102,8 +122,16 @@ class Scenario:
     #   vol_cluster_vov: how much the vol multiplier swings ("vol of vol").
     vol_cluster_rho: float = 0.0
     vol_cluster_vov: float = 0.0
+    # historical replay (restored after review). When use_replay is True the
+    # index follows a real 1-minute BTC path from data/processed/replay_prices.json
+    # instead of the synthetic process, and no scheduled shock is applied.
+    use_replay: bool = False
+    replay_regime: str = ""           # which stored path: "normal" | "stress" | "extreme"
+    replay_offset: int = 0            # start this many minutes into the stored path
 
     def shock_step(self, n_steps: int) -> int | None:
+        if self.use_replay:
+            return None
         if self.shock_frac is None:
             return None
         return max(1, round(self.shock_frac * n_steps))
