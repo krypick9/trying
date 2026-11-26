@@ -140,41 +140,26 @@ the same scale as the book ($1,000 × 50 instead of $5k–20k × 100).
 - **The power check passes but as a cliff** (0 liquidations up to 10×, then ~730 at
   20×). The instrument is insensitive to risk until extreme leverage.
 
-- **The cascade does not amplify — this is the blocker.** At 20×/`long_bias=0.7`,
-  stress, 5 seeds: 722 liquidations, 35 accounts, $549 bad debt, and yet
+- **The cascade amplifies, but only as deep as the book reaches.** Fixed in
+  "the ladder, and why its shape is load-bearing" below. Forced selling now
+  moves the price (−1.3 pp of extra dip at 20×, negative on every seed), but the
+  dip saturates at about −3% because that is where the quoted ladder runs out.
+  Cascades deeper than that are still not representable; widening the reach is a
+  one-dial change with a documented trade-off (see the table below).
 
-        liquidations ON : max drawdown 7.77%, dip vs index -0.11%
-        liquidations OFF: max drawdown 7.78%, dip vs index -0.11%
-        → endogenous amplification: 0.00 pp
-
-  700+ forced liquidations move the price not at all, so the causal spine above
-  never closes its loop. It is not the liquidation engine — that fires correctly.
-  It is the shape of the book: the LP ladder spans only
-  `bg_half_spread + (bg_levels-1) × bg_level_gap` = **0.08%**, so exhausting the
-  entire book can push the price at most 0.08% below centre (the observed dip is
-  -0.11%). Beyond that the book is empty and the last price stops rather than
-  gapping down. Widening the span switches the mechanism back on
-  (`bg_anchor_strength=0.2`, 20×, `long_bias=0.7`, 5 seeds):
-
-        levels  gap     span%   liqs  accts  badDebt   dipON%  dipOFF%  ampDip
-             5  0.0002   0.08    446   32.8     $321    -0.41    -0.41   +0.01
-             5  0.0020   0.80    619   34.4   $5,081    -3.06    -2.39   -0.67
-            20  0.0020   3.80   1894   50.0 $176,187   -15.37   -11.61   -3.75
-            40  0.0050  19.50   1598   50.0 $641,429   -53.91   -46.48   -7.43
-
-  Fixing it properly means three things, and they are the next commit, not this
-  one: (1) a span of roughly 1–4% rather than 0.08%; (2) a decaying per-level
-  size, because `size = bg_depth_btc / bg_levels` currently makes "more levels"
-  mean "uniformly thinner", so span and depth cannot be set independently;
-  (3) finite LP inventory — at `collateral=1e12`, non-liquidatable, and
-  re-centring 80% of every dislocation each minute, the LP is an infinitely deep
-  mean-reverting force that nothing can exhaust.
+- **The leverage cliff is unchanged and is now the main blocker.** The power
+  check still shows 0 liquidations at 2×, 5× and 10× and ~460 at 20×. The ladder
+  fix restored amplification *where liquidations already happen*; it did not make
+  liquidations happen at usable leverage. Until the risk metric responds across a
+  range, an agent effect has nothing to show up in. Candidates: raise the default
+  leverage band, deepen the stress path, or thin near depth.
 
 - **Funding is restored but still small**, because the premium it is computed from
-  is near zero — the LP pins the exchange price to the index. That is the *same*
-  root cause as the missing cascade, not a separate problem; funding will start to
-  matter once the basis can actually move. The cap is now right, and
-  `test_the_cap_is_the_real_venue_order_of_magnitude` guards it.
+  is near zero — the LP anchors the exchange price to the index at
+  `bg_anchor_strength=0.8`, i.e. it erases 80% of any dislocation each minute.
+  The cap is now right (`test_the_cap_is_the_real_venue_order_of_magnitude`
+  guards it); the anchor is the remaining pin, and it is worth a sensitivity run
+  before Phase 1.
 
 - **The flow's per-minute volume is constant by construction.** `flow.py` draws
   heavy-tailed sizes and then renormalises them so the total equals
@@ -231,6 +216,83 @@ control; nothing else about the market changes when you raise it.
 3. **Funding removed.** Re-add as a step in `exchange.step` if you decide perp
    funding matters for your risk metrics.
 
+
+## The ladder, and why its shape is load-bearing
+
+The LP's quoted ladder is the only resting liquidity, so its **price reach**, not
+just its size, decides what the market can represent. The original shape — 5
+levels, flat `0.0002` spacing — spanned 0.08%, which meant exhausting the entire
+book could move the price at most 0.08%. Forced selling therefore produced
+**0.00 pp** of endogenous amplification at every setting tried: the liquidation
+engine fired correctly and nothing happened.
+
+Three changes, which only work together:
+
+1. **Geometric spacing** (`bg_level_gap_growth`) so the ladder reaches ~2.5%
+   with 20 levels rather than 0.08% with 5.
+2. **Geometric size decay** (`bg_size_decay`) with sizes normalised so the levels
+   inside the ±0.10% band sum to `bg_depth_btc`. Reach and near depth are now
+   independent; Phase 0 divided one total by the level count, so "more levels"
+   silently meant "uniformly thinner".
+3. **A finite LP inventory** (`bg_inventory_limit_btc`). Quoting tapers with the
+   inventory the LP has taken on and stops on the side that would add to a full
+   book, so forced selling can actually run out of bids.
+
+### What each part contributes
+
+Stress, 20×, `long_bias=0.7`, 5 seeds, 600 steps:
+
+| | liquidations | bad debt | dip ON | dip OFF | amplification |
+|---|---|---|---|---|---|
+| old shape, no limit | 728 | $610 | −0.11% | −0.11% | **0.00 pp** |
+| old shape, limit 15 | 877 | $661 | −0.11% | −0.12% | **0.00 pp** |
+| new shape, no limit | 371 | $5,321 | −3.07% | −2.24% | −0.82 pp |
+| **new shape, limit 15** | 446 | $5,496 | −3.07% | −1.80% | **−1.26 pp** |
+
+The reach is what makes amplification possible at all — the inventory limit alone
+does nothing (row 2). The limit then roughly doubles it.
+
+### The microstructure did not pay for it
+
+Normal scenario, 5×, `long_bias=0.5`, 5 seeds — the graded levels near the touch
+replaced a 200× cliff between level 0 and level 1, so the spread actually got
+*much* better:
+
+| | one-sided book | near depth | spread | hourly vol |
+|---|---|---|---|---|
+| old shape | 0.2% | 0.416 | 4.1e-5 (46× real) | 0.00292 |
+| **new shape** | **0.0%** | **0.404** | **1.0e-6 (1.15× real)** | **0.00279** |
+| real BTC | ~0% | 0.49 | 8.8e-7 | 0.00260 |
+
+`sanity.py` also moved toward real: kurtosis 8.83 → 11.12 (real ~10), vol
+clustering ACF1 0.076 → 0.130 (real ~0.27).
+
+### One trap, documented in the config
+
+`bg_inventory_limit_btc` must sit **above** the inventory ordinary two-way flow
+pushes onto the LP and **below** what a cascade delivers. The background flow
+caps its own inventory at `bg_flow_inventory_cap_btc` (5 BTC) and the LP is its
+counterparty, so the LP routinely carries ±5 BTC with nothing wrong. At a limit
+of **3** it stopped quoting in *calm* markets: one-sided book 9% of steps, median
+spread 1.0e-3 (~1000× real), local volatility 0.029 (~11× real). At 15 it is
+invisible in calm markets and still binds in a cascade; results are flat between
+15 and 40. `test_the_limit_must_exceed_what_ordinary_flow_pushes_onto_the_lp`
+guards this.
+
+### Reach sets the maximum representable cascade depth
+
+The dip floor tracks the ladder's reach almost exactly (stress, 20×, 3 seeds):
+
+| growth | levels | reach | dip ON | dip OFF | amplification |
+|---|---|---|---|---|---|
+| 1.18 | 20 | 2.47% | −3.07% | −1.80% | −1.27 pp |
+| 1.25 | 20 | 5.47% | −6.74% | −5.36% | −1.38 pp |
+| 1.18 | 28 | 9.58% | −11.70% | −6.94% | −4.75 pp |
+
+The default stays at 2.47% because it gives the best calm-market microstructure.
+If you need deeper cascades — the real 10 Oct drawdown was 15% — raise
+`bg_level_gap_growth` or `bg_levels`, and re-check the calm-market table above,
+because a wider reach puts more of the book in the tail.
 
 ## Where this lives
 
